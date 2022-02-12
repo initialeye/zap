@@ -1,16 +1,6 @@
 const std = @import("std");
-const ThreadPool = @This();
-
 const assert = std.debug.assert;
 const Atomic = std.atomic.Atomic;
-
-stack_size: u32,
-max_threads: u32,
-sync: Atomic(u32) = Atomic(u32).init(@bitCast(u32, Sync{})),
-idle_event: Event = .{},
-join_event: Event = .{},
-run_queue: Node.Queue = .{},
-threads: Atomic(?*Thread) = Atomic(?*Thread).init(null),
 
 const Sync = packed struct {
     /// Tracks the number of threads not searching for Tasks
@@ -43,357 +33,37 @@ pub const Config = struct {
     max_threads: u32,
 };
 
-/// Statically initialize the thread pool using the configuration.
-pub fn init(config: Config) ThreadPool {
-    return .{
-        .stack_size = std.math.max(1, config.stack_size),
-        .max_threads = std.math.max(1, config.max_threads),
-    };
-}
-
-/// Wait for a thread to call shutdown() on the thread pool and kill the worker threads.
-pub fn deinit(self: *ThreadPool) void {
-    self.join();
-    self.* = undefined;
-}
-
 /// A Task represents the unit of Work / Job / Execution that the ThreadPool schedules.
 /// The user provides a `callback` which is invoked when the *Task can run on a thread.
-pub const Task = struct {
-    node: Node = .{},
-    callback: fn (*Task) void,
-};
+pub fn Task(comptime Args: type, comptime Return: type) type {
 
-/// An unordered collection of Tasks which can be submitted for scheduling as a group.
-pub const Batch = struct {
-    len: usize = 0,
-    head: ?*Task = null,
-    tail: ?*Task = null,
+    const Callback = fn (Args) Return;
 
-    /// Create a batch from a single task. 
-    pub fn from(task: *Task) Batch {
-        return Batch{
-            .len = 1,
-            .head = task,
-            .tail = task,
-        };
-    }
+    return struct {
+        const Self = @This();
 
-    /// Another batch into this one, taking ownership of its tasks.
-    pub fn push(self: *Batch, batch: Batch) void {
-        if (batch.len == 0) return;
-        if (self.len == 0) {
-            self.* = batch;
-        } else {
-            self.tail.?.node.next = if (batch.head) |h| &h.node else null;
-            self.tail = batch.tail;
-            self.len += batch.len;
-        }
-    }
-};
+        node: Node = .{},
+        callback: Callback,
+        args: Args,
+        allocator: std.mem.Allocator,
 
-/// Schedule a batch of tasks to be executed by some thread on the thread pool.
-pub fn schedule(self: *ThreadPool, batch: Batch) void {
-    // Sanity check
-    if (batch.len == 0) {
-        return;
-    }
-
-    // Extract out the Node's from the Tasks
-    var list = Node.List{
-        .head = &batch.head.?.node,
-        .tail = &batch.tail.?.node,
-    };
-
-    // Push the task Nodes to the most approriate queue
-    if (Thread.current) |thread| {
-        thread.run_buffer.push(&list) catch thread.run_queue.push(list);
-    } else {
-        self.run_queue.push(list);
-    }
-    
-    // Try to notify a thread
-    const is_waking = false;
-    return self.notify(is_waking);
-}
-
-inline fn notify(self: *ThreadPool, is_waking: bool) void {
-    // Fast path to check the Sync state to avoid calling into notifySlow().
-    // If we're waking, then we need to update the state regardless
-    if (!is_waking) {
-        const sync = @bitCast(Sync, self.sync.load(.Monotonic));
-        if (sync.notified) {
-            return;
-        }
-    }
-    
-    return self.notifySlow(is_waking);
-}
-
-noinline fn notifySlow(self: *ThreadPool, is_waking: bool) void {
-    var sync = @bitCast(Sync, self.sync.load(.Monotonic));
-    while (sync.state != .shutdown) {
-
-        const can_wake = is_waking or (sync.state == .pending);
-        if (is_waking) {
-            assert(sync.state == .waking);
-        }
-
-        var new_sync = sync;
-        new_sync.notified = true;
-        if (can_wake and sync.idle > 0) { // wake up an idle thread
-            new_sync.state = .signaled;
-        } else if (can_wake and sync.spawned < self.max_threads) { // spawn a new thread
-            new_sync.state = .signaled;
-            new_sync.spawned += 1;
-        } else if (is_waking) { // no other thread to pass on "waking" status
-            new_sync.state = .pending;
-        } else if (sync.notified) { // nothing to update
-            return;
-        }
-        
-        // Release barrier synchronizes with Acquire in wait()
-        // to ensure pushes to run queues happen before observing a posted notification.
-        sync = @bitCast(Sync, self.sync.tryCompareAndSwap(
-            @bitCast(u32, sync),
-            @bitCast(u32, new_sync),
-            .Release,
-            .Monotonic,
-        ) orelse {
-            // We signaled to notify an idle thread
-            if (can_wake and sync.idle > 0) {
-                return self.idle_event.notify();
-            }
-
-            // We signaled to spawn a new thread
-            if (can_wake and sync.spawned < self.max_threads) {
-                const spawn_config = std.Thread.SpawnConfig{ .stack_size = self.stack_size };
-                const thread = std.Thread.spawn(spawn_config, Thread.run, .{self}) catch return self.unregister(null);
-                return thread.detach();
-            }
-
-            return;
-        });
-    }
-}
-
-noinline fn wait(self: *ThreadPool, _is_waking: bool) error{Shutdown}!bool {
-    var is_idle = false;
-    var is_waking = _is_waking;
-    var sync = @bitCast(Sync, self.sync.load(.Monotonic));
-
-    while (true) {
-        if (sync.state == .shutdown) return error.Shutdown;
-        if (is_waking) assert(sync.state == .waking);
-
-        // Consume a notification made by notify().
-        if (sync.notified) {
-            var new_sync = sync;
-            new_sync.notified = false;
-            if (is_idle) 
-                new_sync.idle -= 1;
-            if (sync.state == .signaled)
-                new_sync.state = .waking;
-
-            // Acquire barrier synchronizes with notify() 
-            // to ensure that pushes to run queue are observed after wait() returns. 
-            sync = @bitCast(Sync, self.sync.tryCompareAndSwap(
-                @bitCast(u32, sync),
-                @bitCast(u32, new_sync),
-                .Acquire,
-                .Monotonic,
-            ) orelse {
-                return is_waking or (sync.state == .signaled);
-            });
-
-        // No notification to consume.
-        // Mark this thread as idle before sleeping on the idle_event.
-        } else if (!is_idle) {
-            var new_sync = sync;
-            new_sync.idle += 1;
-            if (is_waking) 
-                new_sync.state = .pending;
-
-            sync = @bitCast(Sync, self.sync.tryCompareAndSwap(
-                @bitCast(u32, sync),
-                @bitCast(u32, new_sync),
-                .Monotonic,
-                .Monotonic,
-            ) orelse {
-                is_waking = false;
-                is_idle = true;
-                continue;
-            });
-
-        // Wait for a signal by either notify() or shutdown() without wasting cpu cycles.
-        // TODO: Add I/O polling here.
-        } else {
-            self.idle_event.wait();
-            sync = @bitCast(Sync, self.sync.load(.Monotonic));
-        }
-    }
-}
-
-/// Marks the thread pool as shutdown
-pub noinline fn shutdown(self: *ThreadPool) void {
-    var sync = @bitCast(Sync, self.sync.load(.Monotonic));
-    while (sync.state != .shutdown) {
-        var new_sync = sync;
-        new_sync.notified = true;
-        new_sync.state = .shutdown;
-        new_sync.idle = 0;
-
-        // Full barrier to synchronize with both wait() and notify()
-        sync = @bitCast(Sync, self.sync.tryCompareAndSwap(
-            @bitCast(u32, sync),
-            @bitCast(u32, new_sync),
-            .AcqRel,
-            .Monotonic,
-        ) orelse {
-            // Wake up any threads sleeping on the idle_event.
-            // TODO: I/O polling notification here.
-            if (sync.idle > 0) self.idle_event.shutdown();
-            return;
-        });
-    }
-}
-
-fn register(noalias self: *ThreadPool, noalias thread: *Thread) void {
-    // Push the thread onto the threads stack in a lock-free manner.
-    var threads = self.threads.load(.Monotonic);
-    while (true) {
-        thread.next = threads;
-        threads = self.threads.tryCompareAndSwap(
-            threads,
-            thread,
-            .Release,
-            .Monotonic,
-        ) orelse break;
-    }
-}
-
-fn unregister(noalias self: *ThreadPool, noalias maybe_thread: ?*Thread) void {
-    // Un-spawn one thread, either due to a failed OS thread spawning or the thread is exitting.
-    const one_spawned = @bitCast(u32, Sync{ .spawned = 1 });
-    const sync = @bitCast(Sync, self.sync.fetchSub(one_spawned, .Release));
-    assert(sync.spawned > 0);
-
-    // The last thread to exit must wake up the thread pool join()er
-    // who will start the chain to shutdown all the threads.
-    if (sync.state == .shutdown and sync.spawned == 1) {
-        self.join_event.notify();
-    }
-
-    // If this is a thread pool thread, wait for a shutdown signal by the thread pool join()er.
-    const thread = maybe_thread orelse return;
-    thread.join_event.wait();
-
-    // After receiving the shutdown signal, shutdown the next thread in the pool.
-    // We have to do that without touching the thread pool itself since it's memory is invalidated by now.
-    // So just follow our .next link.
-    const next_thread = thread.next orelse return;
-    next_thread.join_event.notify();
-}
-
-fn join(self: *ThreadPool) void {
-    // Wait for the thread pool to be shutdown() then for all threads to enter a joinable state
-    var sync = @bitCast(Sync, self.sync.load(.Monotonic));
-    if (!(sync.state == .shutdown and sync.spawned == 0)) {
-        self.join_event.wait();
-        sync = @bitCast(Sync, self.sync.load(.Monotonic));
-    }
-
-    assert(sync.state == .shutdown);
-    assert(sync.spawned == 0);
-
-    // If there are threads, start off the chain sending it the shutdown signal.
-    // The thread receives the shutdown signal and sends it to the next thread, and the next..
-    const thread = self.threads.load(.Acquire) orelse return;
-    thread.join_event.notify();
-}
-
-const Thread = struct {
-    next: ?*Thread = null,
-    target: ?*Thread = null,
-    join_event: Event = .{},
-    run_queue: Node.Queue = .{},
-    run_buffer: Node.Buffer = .{},
-    
-    threadlocal var current: ?*Thread = null;
-
-    /// Thread entry point which runs a worker for the ThreadPool
-    fn run(thread_pool: *ThreadPool) void {
-        var self = Thread{};
-        current = &self;
-
-        thread_pool.register(&self);
-        defer thread_pool.unregister(&self);
-
-        var is_waking = false;
-        while (true) {
-            is_waking = thread_pool.wait(is_waking) catch return;
-
-            while (self.pop(thread_pool)) |result| {
-                if (result.pushed or is_waking) 
-                    thread_pool.notify(is_waking);
-                is_waking = false;
-
-                const task = @fieldParentPtr(Task, "node", result.node);
-                (task.callback)(task);
-            }
-        }
-    }
-
-    /// Try to dequeue a Node/Task from the ThreadPool.
-    /// Spurious reports of dequeue() returning empty are allowed.
-    fn pop(noalias self: *Thread, noalias thread_pool: *ThreadPool) ?Node.Buffer.Stole {
-        // Check our local buffer first
-        if (self.run_buffer.pop()) |node| {
-            return Node.Buffer.Stole{
-                .node = node,
-                .pushed = false,
+        pub fn create(cb: Callback, args: Args, alloc: std.mem.Allocator) !*Self {
+            const ret = try alloc.create(Self);
+            ret.* = .{
+                .callback = cb,
+                .args = args,
+                .allocator = alloc,
             };
-        }
-        
-        // Then check our local queue
-        if (self.run_buffer.consume(&self.run_queue)) |stole| {
-            return stole;
+            return ret;
         }
 
-        // Then the global queue
-        if (self.run_buffer.consume(&thread_pool.run_queue)) |stole| {
-            return stole;
+        pub fn execute(self: *const Self) Return {
+            const ret = self.callback(self.args);
+            self.allocator.destroy(self);
+            return ret;
         }
-
-        // TODO: add optimistic I/O polling here
-        
-        // Then try work stealing from other threads
-        var num_threads: u32 = @bitCast(Sync, thread_pool.sync.load(.Monotonic)).spawned;
-        while (num_threads > 0) : (num_threads -= 1) {
-            // Traverse the stack of registered threads on the thread pool
-            const target = self.target orelse thread_pool.threads.load(.Acquire) orelse unreachable;
-            self.target = target.next;
-
-            // Try to steal from their queue first to avoid contention (the target steal's from queue last).
-            if (self.run_buffer.consume(&target.run_queue)) |stole| {
-                return stole;
-            }
-
-            // Skip stealing from the buffer if we're the target.
-            // We still steal from our own queue above given it may have just been locked the first time we tried.
-            if (target == self) {
-                continue;
-            }
-
-            // Steal from the buffer of a remote thread as a last resort
-            if (self.run_buffer.steal(&target.run_buffer)) |stole| {
-                return stole;
-            }
-        }
-
-        return null;
-    }
-};
+    };
+}
 
 /// An event which stores 1 semaphore token and is multi-threaded safe.
 /// The event can be shutdown(), waking up all wait()ing threads and 
@@ -789,3 +459,367 @@ const Node = struct {
         }
     };
 };
+
+pub fn ThreadPool(
+    comptime Args: type,
+    comptime Return: type
+) type {
+    return struct {
+
+        const Self = @This();
+
+        stack_size: u32,
+        max_threads: u32,
+        sync: Atomic(u32) = Atomic(u32).init(@bitCast(u32, Sync{})),
+        idle_event: Event = .{},
+        join_event: Event = .{},
+        run_queue: Node.Queue = .{},
+        threads: Atomic(?*Thread) = Atomic(?*Thread).init(null),
+
+        /// Statically initialize the thread pool using the configuration.
+        pub fn init(config: Config) Self {
+            return .{
+                .stack_size = std.math.max(1, config.stack_size),
+                .max_threads = std.math.max(1, config.max_threads),
+            };
+        }
+
+        /// Wait for a thread to call shutdown() on the thread pool and kill the worker threads.
+        pub fn deinit(self: *Self) void {
+            self.join();
+            self.* = undefined;
+        }
+
+        /// An unordered collection of Tasks which can be submitted for scheduling as a group.
+        pub const Batch = struct {
+            len: usize = 0,
+            head: ?*Task(Args, Return) = null,
+            tail: ?*Task(Args, Return) = null,
+
+            /// Create a batch from a single task. 
+            pub fn from(task: anytype) Batch {
+                return Batch{
+                    .len = 1,
+                    .head = task,
+                    .tail = task,
+                };
+            }
+
+            /// Another batch into this one, taking ownership of its tasks.
+            pub fn push(self: *Batch, batch: Batch) void {
+                if (batch.len == 0) return;
+                if (self.len == 0) {
+                    self.* = batch;
+                } else {
+                    self.tail.?.node.next = if (batch.head) |h| &h.node else null;
+                    self.tail = batch.tail;
+                    self.len += batch.len;
+                }
+            }
+        };
+
+        /// Schedule a batch of tasks to be executed by some thread on the thread pool.
+        pub fn schedule(self: *Self, batch: Batch) void {
+            // Sanity check
+            if (batch.len == 0) {
+                return;
+            }
+
+            // Extract out the Node's from the Tasks
+            var list = Node.List{
+                .head = &batch.head.?.node,
+                .tail = &batch.tail.?.node,
+            };
+
+            // Push the task Nodes to the most approriate queue
+            if (Thread.current) |thread| {
+                thread.run_buffer.push(&list) catch thread.run_queue.push(list);
+            } else {
+                self.run_queue.push(list);
+            }
+            
+            // Try to notify a thread
+            const is_waking = false;
+            return self.notify(is_waking);
+        }
+
+        inline fn notify(self: *Self, is_waking: bool) void {
+            // Fast path to check the Sync state to avoid calling into notifySlow().
+            // If we're waking, then we need to update the state regardless
+            if (!is_waking) {
+                const sync = @bitCast(Sync, self.sync.load(.Monotonic));
+                if (sync.notified) {
+                    return;
+                }
+            }
+            
+            return self.notifySlow(is_waking);
+        }
+
+        noinline fn notifySlow(self: *Self, is_waking: bool) void {
+            var sync = @bitCast(Sync, self.sync.load(.Monotonic));
+            while (sync.state != .shutdown) {
+
+                const can_wake = is_waking or (sync.state == .pending);
+                if (is_waking) {
+                    assert(sync.state == .waking);
+                }
+
+                var new_sync = sync;
+                new_sync.notified = true;
+                if (can_wake and sync.idle > 0) { // wake up an idle thread
+                    new_sync.state = .signaled;
+                } else if (can_wake and sync.spawned < self.max_threads) { // spawn a new thread
+                    new_sync.state = .signaled;
+                    new_sync.spawned += 1;
+                } else if (is_waking) { // no other thread to pass on "waking" status
+                    new_sync.state = .pending;
+                } else if (sync.notified) { // nothing to update
+                    return;
+                }
+                
+                // Release barrier synchronizes with Acquire in wait()
+                // to ensure pushes to run queues happen before observing a posted notification.
+                sync = @bitCast(Sync, self.sync.tryCompareAndSwap(
+                    @bitCast(u32, sync),
+                    @bitCast(u32, new_sync),
+                    .Release,
+                    .Monotonic,
+                ) orelse {
+                    // We signaled to notify an idle thread
+                    if (can_wake and sync.idle > 0) {
+                        return self.idle_event.notify();
+                    }
+
+                    // We signaled to spawn a new thread
+                    if (can_wake and sync.spawned < self.max_threads) {
+                        const spawn_config = std.Thread.SpawnConfig{ .stack_size = self.stack_size };
+                        const thread = std.Thread.spawn(spawn_config, Thread.run, .{self}) catch return self.unregister(null);
+                        return thread.detach();
+                    }
+
+                    return;
+                });
+            }
+        }
+
+        noinline fn wait(self: *Self, _is_waking: bool) error{Shutdown}!bool {
+            var is_idle = false;
+            var is_waking = _is_waking;
+            var sync = @bitCast(Sync, self.sync.load(.Monotonic));
+
+            while (true) {
+                if (sync.state == .shutdown) return error.Shutdown;
+                if (is_waking) assert(sync.state == .waking);
+
+                // Consume a notification made by notify().
+                if (sync.notified) {
+                    var new_sync = sync;
+                    new_sync.notified = false;
+                    if (is_idle) 
+                        new_sync.idle -= 1;
+                    if (sync.state == .signaled)
+                        new_sync.state = .waking;
+
+                    // Acquire barrier synchronizes with notify() 
+                    // to ensure that pushes to run queue are observed after wait() returns. 
+                    sync = @bitCast(Sync, self.sync.tryCompareAndSwap(
+                        @bitCast(u32, sync),
+                        @bitCast(u32, new_sync),
+                        .Acquire,
+                        .Monotonic,
+                    ) orelse {
+                        return is_waking or (sync.state == .signaled);
+                    });
+
+                // No notification to consume.
+                // Mark this thread as idle before sleeping on the idle_event.
+                } else if (!is_idle) {
+                    var new_sync = sync;
+                    new_sync.idle += 1;
+                    if (is_waking) 
+                        new_sync.state = .pending;
+
+                    sync = @bitCast(Sync, self.sync.tryCompareAndSwap(
+                        @bitCast(u32, sync),
+                        @bitCast(u32, new_sync),
+                        .Monotonic,
+                        .Monotonic,
+                    ) orelse {
+                        is_waking = false;
+                        is_idle = true;
+                        continue;
+                    });
+
+                // Wait for a signal by either notify() or shutdown() without wasting cpu cycles.
+                // TODO: Add I/O polling here.
+                } else {
+                    self.idle_event.wait();
+                    sync = @bitCast(Sync, self.sync.load(.Monotonic));
+                }
+            }
+        }
+
+        /// Marks the thread pool as shutdown
+        pub noinline fn shutdown(self: *Self) void {
+            var sync = @bitCast(Sync, self.sync.load(.Monotonic));
+            while (sync.state != .shutdown) {
+                var new_sync = sync;
+                new_sync.notified = true;
+                new_sync.state = .shutdown;
+                new_sync.idle = 0;
+
+                // Full barrier to synchronize with both wait() and notify()
+                sync = @bitCast(Sync, self.sync.tryCompareAndSwap(
+                    @bitCast(u32, sync),
+                    @bitCast(u32, new_sync),
+                    .AcqRel,
+                    .Monotonic,
+                ) orelse {
+                    // Wake up any threads sleeping on the idle_event.
+                    // TODO: I/O polling notification here.
+                    if (sync.idle > 0) self.idle_event.shutdown();
+                    return;
+                });
+            }
+        }
+
+        fn register(noalias self: *Self, noalias thread: *Thread) void {
+            // Push the thread onto the threads stack in a lock-free manner.
+            var threads = self.threads.load(.Monotonic);
+            while (true) {
+                thread.next = threads;
+                threads = self.threads.tryCompareAndSwap(
+                    threads,
+                    thread,
+                    .Release,
+                    .Monotonic,
+                ) orelse break;
+            }
+        }
+
+        fn unregister(noalias self: *Self, noalias maybe_thread: ?*Thread) void {
+            // Un-spawn one thread, either due to a failed OS thread spawning or the thread is exitting.
+            const one_spawned = @bitCast(u32, Sync{ .spawned = 1 });
+            const sync = @bitCast(Sync, self.sync.fetchSub(one_spawned, .Release));
+            assert(sync.spawned > 0);
+
+            // The last thread to exit must wake up the thread pool join()er
+            // who will start the chain to shutdown all the threads.
+            if (sync.state == .shutdown and sync.spawned == 1) {
+                self.join_event.notify();
+            }
+
+            // If this is a thread pool thread, wait for a shutdown signal by the thread pool join()er.
+            const thread = maybe_thread orelse return;
+            thread.join_event.wait();
+
+            // After receiving the shutdown signal, shutdown the next thread in the pool.
+            // We have to do that without touching the thread pool itself since it's memory is invalidated by now.
+            // So just follow our .next link.
+            const next_thread = thread.next orelse return;
+            next_thread.join_event.notify();
+        }
+
+        fn join(self: *Self) void {
+            // Wait for the thread pool to be shutdown() then for all threads to enter a joinable state
+            var sync = @bitCast(Sync, self.sync.load(.Monotonic));
+            if (!(sync.state == .shutdown and sync.spawned == 0)) {
+                self.join_event.wait();
+                sync = @bitCast(Sync, self.sync.load(.Monotonic));
+            }
+
+            assert(sync.state == .shutdown);
+            assert(sync.spawned == 0);
+
+            // If there are threads, start off the chain sending it the shutdown signal.
+            // The thread receives the shutdown signal and sends it to the next thread, and the next..
+            const thread = self.threads.load(.Acquire) orelse return;
+            thread.join_event.notify();
+        }
+
+        const Thread = struct {
+            next: ?*Thread = null,
+            target: ?*Thread = null,
+            join_event: Event = .{},
+            run_queue: Node.Queue = .{},
+            run_buffer: Node.Buffer = .{},
+            
+            threadlocal var current: ?*Thread = null;
+
+            /// Thread entry point which runs a worker for the ThreadPool
+            fn run(thread_pool: *Self) void {
+                var self = Thread{};
+                current = &self;
+
+                thread_pool.register(&self);
+                defer thread_pool.unregister(&self);
+
+                var is_waking = false;
+                while (true) {
+                    is_waking = thread_pool.wait(is_waking) catch return;
+
+                    while (self.pop(thread_pool)) |result| {
+                        if (result.pushed or is_waking) 
+                            thread_pool.notify(is_waking);
+                        is_waking = false;
+
+                        const task = @fieldParentPtr(Task(Args, Return), "node", result.node);
+                        _ = task.execute();
+                    }
+                }
+            }
+
+            /// Try to dequeue a Node/Task from the ThreadPool.
+            /// Spurious reports of dequeue() returning empty are allowed.
+            fn pop(noalias self: *Thread, noalias thread_pool: *Self) ?Node.Buffer.Stole {
+                // Check our local buffer first
+                if (self.run_buffer.pop()) |node| {
+                    return Node.Buffer.Stole{
+                        .node = node,
+                        .pushed = false,
+                    };
+                }
+                
+                // Then check our local queue
+                if (self.run_buffer.consume(&self.run_queue)) |stole| {
+                    return stole;
+                }
+
+                // Then the global queue
+                if (self.run_buffer.consume(&thread_pool.run_queue)) |stole| {
+                    return stole;
+                }
+
+                // TODO: add optimistic I/O polling here
+                
+                // Then try work stealing from other threads
+                var num_threads: u32 = @bitCast(Sync, thread_pool.sync.load(.Monotonic)).spawned;
+                while (num_threads > 0) : (num_threads -= 1) {
+                    // Traverse the stack of registered threads on the thread pool
+                    const target = self.target orelse thread_pool.threads.load(.Acquire) orelse unreachable;
+                    self.target = target.next;
+
+                    // Try to steal from their queue first to avoid contention (the target steal's from queue last).
+                    if (self.run_buffer.consume(&target.run_queue)) |stole| {
+                        return stole;
+                    }
+
+                    // Skip stealing from the buffer if we're the target.
+                    // We still steal from our own queue above given it may have just been locked the first time we tried.
+                    if (target == self) {
+                        continue;
+                    }
+
+                    // Steal from the buffer of a remote thread as a last resort
+                    if (self.run_buffer.steal(&target.run_buffer)) |stole| {
+                        return stole;
+                    }
+                }
+
+                return null;
+
+           }
+        };
+    };
+}
